@@ -26,9 +26,10 @@ with st.sidebar:
     )
     model = st.selectbox(
         "Model",
-        ["gemini-2.0-flash", "gemini-1.5-flash"],
+        ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
         index=0,
-        help="gemini-2.0-flash is faster; gemini-1.5-flash may be more verbose.",
+        help="gemini-2.5-flash gives more thorough explanations; "
+             "gemini-2.5-flash-lite is faster and cheaper.",
     )
     if st.button("Clear chat"):
         st.session_state.pop("service", None)
@@ -50,6 +51,7 @@ if "messages" not in st.session_state:
 
 service: ChatService = st.session_state.service
 service.temperature = temperature
+service.model = model
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):

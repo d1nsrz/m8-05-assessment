@@ -1,11 +1,16 @@
 """
 Backend for CodeClarify — a focused code-explanation assistant.
 
-Model choice: Gemini 2.0 Flash (hosted)
-  Justification: free tier, ~500 ms first-token latency, strong on
-  short-to-medium code snippets, no local GPU required. Trade-off:
-  requires an API key and sends code to Google's servers, whereas
-  Ollama keeps data local but needs a capable machine.
+Model choice: Gemini 2.5 Flash (hosted)
+  Justification: generous free tier, strong on short-to-medium code
+  snippets, no local GPU required. Trade-off: requires an API key and
+  sends code to Google's servers, whereas Ollama keeps data local but
+  needs a capable machine.
+
+  Note: Gemini model names get retired periodically (gemini-1.5-flash
+  and gemini-2.0-flash are both gone as of mid-2026). If you start
+  seeing 404 errors, check https://ai.google.dev/gemini-api/docs/models
+  for the current model list and update the options in app.py.
 
 Safety mitigations live in _guard_input / _guard_output.
 """
@@ -17,7 +22,7 @@ import re
 
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 load_dotenv()
 
@@ -72,7 +77,7 @@ class ChatService:
     """Holds conversation state and talks to Gemini."""
 
     def __init__(self, model: str | None = None, temperature: float = 0.4) -> None:
-        self.model = model or os.environ.get("MODEL", "gemini-2.0-flash")
+        self.model = model or os.environ.get("MODEL", "gemini-2.5-flash")
         self.temperature = temperature
         self.history: list[dict[str, str]] = []
         self.total_input_tokens: int = 0
@@ -131,6 +136,18 @@ class ChatService:
             max_output_tokens=1024,
         )
 
+    def _format_error(self, e: Exception) -> str:
+        """Turn an API/network exception into a user-facing chat message."""
+        if isinstance(e, errors.APIError):
+            return (
+                f"⚠️ **{self.model}** returned error {e.code} ({e.status}): "
+                f"{e.message}\n\n"
+                "Google periodically retires Gemini model versions — try "
+                "another model in the sidebar, or check "
+                "https://ai.google.dev/gemini-api/docs/models for current names."
+            )
+        return f"⚠️ Couldn't reach the model: {e}"
+
     def send(self, user_text: str) -> str:
         """Send one user turn and return the assistant's reply (blocking)."""
         blocked = self._guard_input(user_text)
@@ -142,11 +159,16 @@ class ChatService:
 
         self.history.append({"role": "user", "content": user_text})
 
-        response = self._client.models.generate_content(
-            model=self.model,
-            contents=self._build_contents(),
-            config=self._gen_config(),
-        )
+        try:
+            response = self._client.models.generate_content(
+                model=self.model,
+                contents=self._build_contents(),
+                config=self._gen_config(),
+            )
+        except Exception as e:  # noqa: BLE001 - surface any API/network failure to the user
+            reply = self._format_error(e)
+            self.history.append({"role": "assistant", "content": reply})
+            return reply
 
         meta = response.usage_metadata
         if meta:
@@ -154,6 +176,8 @@ class ChatService:
             self.total_output_tokens += meta.candidates_token_count or 0
 
         reply = self._guard_output(response.text or "")
+        if not reply.strip():
+            reply = "_(The model returned an empty response — try rephrasing your question.)_"
         self.history.append({"role": "assistant", "content": reply})
         return reply
 
@@ -169,18 +193,28 @@ class ChatService:
         self.history.append({"role": "user", "content": user_text})
 
         accumulated: list[str] = []
-        for chunk in self._client.models.generate_content_stream(
-            model=self.model,
-            contents=self._build_contents(),
-            config=self._gen_config(),
-        ):
-            if chunk.text:
-                accumulated.append(chunk.text)
-                yield chunk.text
-            meta = chunk.usage_metadata
-            if meta:
-                self.total_input_tokens += meta.prompt_token_count or 0
-                self.total_output_tokens += meta.candidates_token_count or 0
+        try:
+            for chunk in self._client.models.generate_content_stream(
+                model=self.model,
+                contents=self._build_contents(),
+                config=self._gen_config(),
+            ):
+                if chunk.text:
+                    accumulated.append(chunk.text)
+                    yield chunk.text
+                meta = chunk.usage_metadata
+                if meta:
+                    self.total_input_tokens += meta.prompt_token_count or 0
+                    self.total_output_tokens += meta.candidates_token_count or 0
+        except Exception as e:  # noqa: BLE001 - surface any API/network failure to the user
+            error_text = self._format_error(e)
+            accumulated.append(error_text)
+            yield error_text
+
+        if not accumulated:
+            note = "_(The model returned an empty response — try rephrasing your question.)_"
+            accumulated.append(note)
+            yield note
 
         reply = self._guard_output("".join(accumulated))
         self.history.append({"role": "assistant", "content": reply})
